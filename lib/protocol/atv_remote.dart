@@ -33,16 +33,21 @@ class AtvRemote {
 
   int _imeCounter = 0;
   int _fieldCounter = 0;
-  bool _imeKnown = false;
 
-  /// Feature flags: PING | KEY | IME | POWER | VOLUME | APP_LINK.
-  static const _features = 1 | 2 | 4 | 32 | 64 | 512;
+  Completer<int>? _voiceBegin;
+  int? _voiceSession;
+
+  /// Feature flags: PING | KEY | IME | VOICE | POWER | VOLUME | APP_LINK.
+  static const _features = 1 | 2 | 4 | 8 | 32 | 64 | 512;
 
   void Function()? onDisconnected;
   void Function(TvVolume volume)? onVolume;
   void Function(bool isOn)? onPower;
   void Function(String package)? onCurrentApp;
   void Function(String model, String vendor)? onDeviceInfo;
+
+  /// Debug hook: every decoded message from the TV.
+  void Function(ProtoMessage message)? onRawMessage;
 
   AtvRemote(this.host, this.identity, {this.port = 6466});
 
@@ -74,7 +79,9 @@ class AtvRemote {
         _lastMessage = DateTime.now();
         for (final frame in _decoder.add(data)) {
           try {
-            _handle(ProtoMessage.decode(frame), ready);
+            final msg = ProtoMessage.decode(frame);
+            onRawMessage?.call(msg);
+            _handle(msg, ready);
           } catch (_) {
             // Ignore messages we cannot parse; the protocol has many extras.
           }
@@ -153,7 +160,15 @@ class AtvRemote {
       final edit = m.message(21)!;
       _imeCounter = edit.intField(1);
       _fieldCounter = edit.intField(2);
-      _imeKnown = true;
+    } else if (m.has(30)) {
+      // remote_voice_begin: the TV opened a voice session for us.
+      final sid = m.message(30)?.intField(1) ?? 0;
+      final waiter = _voiceBegin;
+      if (waiter != null && !waiter.isCompleted) {
+        // Acknowledge immediately, as the TV expects.
+        _send(ProtoWriter()..message(30, ProtoWriter()..int32(1, sid)));
+        waiter.complete(sid);
+      }
     } else if (m.has(40)) {
       onPower?.call(m.message(40)?.boolField(1) ?? false);
     } else if (m.has(50)) {
@@ -161,6 +176,9 @@ class AtvRemote {
       onVolume?.call(TvVolume(v.intField(7), v.intField(6), v.boolField(8)));
     }
   }
+
+  /// Sends an already-built RemoteMessage (debugging aid).
+  void debugSend(ProtoWriter msg) => _send(msg);
 
   void _send(ProtoWriter msg) {
     final s = _socket;
@@ -188,41 +206,97 @@ class AtvRemote {
     _send(ProtoWriter()..message(90, ProtoWriter()..string(1, link)));
   }
 
-  /// Types [text] into the focused text field on the TV.
-  void sendText(String text) {
-    if (text.isEmpty) return;
-    if (_imeKnown) {
-      final pos = text.length - 1;
-      _send(
-        ProtoWriter()..message(
-          21,
-          ProtoWriter()
-            ..int32(1, _imeCounter)
-            ..int32(2, _fieldCounter)
-            ..message(
-              3,
-              ProtoWriter()
-                ..int32(1, 1)
-                ..message(
-                  2,
-                  ProtoWriter()
-                    ..int32(1, pos)
-                    ..int32(2, pos)
-                    ..string(3, text),
-                ),
-            ),
-        ),
-      );
-      return;
-    }
-    // Fallback: emulate key presses for characters we can map.
-    for (final ch in text.split('')) {
-      final code = TvKey.forChar(ch);
-      if (code != null) sendKey(code);
+  bool get voiceActive => _voiceSession != null;
+
+  /// Starts a voice search on the TV (its Assistant opens and listens to the
+  /// audio we stream). Returns the session id.
+  Future<int> startVoice() async {
+    if (_voiceSession != null) endVoice();
+    final waiter = Completer<int>();
+    _voiceBegin = waiter;
+    sendKey(TvKey.search);
+    try {
+      final sid = await waiter.future.timeout(const Duration(seconds: 3));
+      _voiceSession = sid;
+      return sid;
+    } on TimeoutException {
+      throw Exception('This TV did not start a voice search.');
+    } finally {
+      _voiceBegin = null;
     }
   }
 
+  /// Streams 16-bit little-endian mono PCM at 8 kHz. The TV needs payloads of
+  /// 8-20 KB, so short chunks are zero-padded and long ones split.
+  void sendVoice(List<int> pcm) {
+    final sid = _voiceSession;
+    if (sid == null) return;
+    const maxChunk = 20 * 1024;
+    const minChunk = 8 * 1024;
+    for (var i = 0; i < pcm.length; i += maxChunk) {
+      final end = i + maxChunk < pcm.length ? i + maxChunk : pcm.length;
+      var piece = pcm.sublist(i, end);
+      if (piece.length < minChunk) {
+        piece = [...piece, ...List<int>.filled(minChunk - piece.length, 0)];
+      }
+      _send(
+        ProtoWriter()..message(
+          31,
+          ProtoWriter()
+            ..int32(1, sid)
+            ..bytes(2, piece),
+        ),
+      );
+    }
+  }
+
+  void endVoice() {
+    final sid = _voiceSession;
+    if (sid == null) return;
+    _voiceSession = null;
+    _send(ProtoWriter()..message(32, ProtoWriter()..int32(1, sid)));
+  }
+
+  /// Sends an IME batch edit with explicit counters (debugging aid).
+  void debugSendIme(int imeCounter, int fieldCounter, String text) {
+    _imeCounter = imeCounter;
+    _fieldCounter = fieldCounter;
+    sendText(text);
+  }
+
+  /// Inserts [text] at the cursor of the focused text field on the TV.
+  ///
+  /// Uses an IME batch edit. Many TVs (e.g. Xiaomi TV Box with YouTube) never
+  /// announce their IME counters, yet accept edits with counters of 0, so we
+  /// always send through the IME. Letter key codes are ignored by YouTube's
+  /// search box, so they are not a usable fallback.
+  void sendText(String text) {
+    if (text.isEmpty) return;
+    final pos = text.length - 1;
+    _send(
+      ProtoWriter()..message(
+        21,
+        ProtoWriter()
+          ..int32(1, _imeCounter)
+          ..int32(2, _fieldCounter)
+          ..message(
+            3,
+            ProtoWriter()
+              ..int32(1, 1)
+              ..message(
+                2,
+                ProtoWriter()
+                  ..int32(1, pos)
+                  ..int32(2, pos)
+                  ..string(3, text),
+              ),
+          ),
+      ),
+    );
+  }
+
   void _drop({bool notify = true}) {
+    _voiceSession = null;
     _watchdog?.cancel();
     _watchdog = null;
     final s = _socket;

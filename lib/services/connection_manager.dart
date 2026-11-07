@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 
@@ -9,6 +10,7 @@ import '../protocol/atv_remote.dart';
 import '../protocol/cast_client.dart';
 import 'app_store.dart';
 import 'media_server.dart';
+import 'native_bridge.dart';
 
 enum LinkState {
   disconnected,
@@ -272,6 +274,7 @@ class ConnectionManager extends ChangeNotifier {
 
   Future<void> disconnect() async {
     _userDisconnect = true;
+    if (listening) await stopVoice();
     _ticker?.cancel();
     await _remote?.close();
     _remote = null;
@@ -295,6 +298,68 @@ class ConnectionManager extends ChangeNotifier {
       _remote?.sendKey(code, direction: down ? 1 : 2);
   void text(String t) => _remote?.sendText(t);
   void openLink(String link) => _remote?.launchApp(link);
+
+  // ---------------- Voice search ----------------
+
+  bool listening = false;
+  double voiceLevel = 0;
+  StreamSubscription<Uint8List>? _micSub;
+  Timer? _voiceTimeout;
+
+  /// Opens voice search on the TV and streams the phone microphone to it.
+  /// Returns an error message, or null when listening started.
+  Future<String?> startVoice() async {
+    final remote = _remote;
+    if (remote == null) return 'Connect to the TV first.';
+    if (listening) return null;
+    if (!await NativeBridge.requestMicPermission()) {
+      return 'Allow microphone access to use voice search.';
+    }
+    try {
+      await remote.startVoice();
+    } catch (e) {
+      return _friendly(e);
+    }
+    _micSub = NativeBridge.micChunks.listen((chunk) {
+      remote.sendVoice(chunk);
+      voiceLevel = _level(chunk);
+      notifyListeners();
+    });
+    if (!await NativeBridge.startMic()) {
+      await stopVoice();
+      return 'Could not start the microphone.';
+    }
+    listening = true;
+    _voiceTimeout = Timer(const Duration(seconds: 10), stopVoice);
+    notifyListeners();
+    return null;
+  }
+
+  Future<void> stopVoice() async {
+    if (!listening && _micSub == null) return;
+    _voiceTimeout?.cancel();
+    listening = false;
+    await NativeBridge.stopMic();
+    // Let the final chunk of speech reach the TV before closing the session.
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+    await _micSub?.cancel();
+    _micSub = null;
+    _remote?.endVoice();
+    voiceLevel = 0;
+    notifyListeners();
+  }
+
+  static double _level(Uint8List pcm) {
+    final data = ByteData.sublistView(pcm);
+    var sum = 0.0;
+    final n = pcm.length ~/ 2;
+    for (var i = 0; i < n; i++) {
+      final v = data.getInt16(i * 2, Endian.little).toDouble();
+      sum += v * v;
+    }
+    if (n == 0) return 0;
+    return (math.sqrt(sum / n) / 6000).clamp(0.0, 1.0);
+  }
 
   // ---------------- Casting ----------------
 

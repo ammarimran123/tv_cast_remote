@@ -283,8 +283,8 @@ class _RemoteScreenState extends State<RemoteScreen> {
         ),
         RemoteButton(
           icon: Icons.mic_rounded,
-          tooltip: 'Assistant',
-          onPressed: () => k(TvKey.assist),
+          tooltip: 'Voice search',
+          onPressed: _voice,
         ),
       ],
     );
@@ -506,76 +506,20 @@ class _RemoteScreenState extends State<RemoteScreen> {
     conn.openLink(isPackage ? 'market://launch?id=$link' : link);
   }
 
+  Future<void> _voice() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => const _VoiceSheet(),
+    );
+  }
+
   Future<void> _keyboard() async {
-    final c = TextEditingController();
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
-      builder: (ctx) => Padding(
-        padding: EdgeInsets.fromLTRB(
-          20,
-          0,
-          20,
-          MediaQuery.of(ctx).viewInsets.bottom + 20,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Type on TV',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              'Select a text field on the TV first, then type here.',
-              style: TextStyle(
-                color: Theme.of(ctx).colorScheme.onSurfaceVariant,
-              ),
-            ),
-            const SizedBox(height: 14),
-            TextField(
-              controller: c,
-              autofocus: true,
-              textInputAction: TextInputAction.send,
-              decoration: const InputDecoration(
-                hintText: 'Search or type text',
-              ),
-              onSubmitted: (v) {
-                conn.text(v);
-                k(TvKey.enter);
-                c.clear();
-              },
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                IconButton.filledTonal(
-                  tooltip: 'Backspace',
-                  onPressed: () => k(TvKey.del),
-                  icon: const Icon(Icons.backspace_outlined),
-                ),
-                const SizedBox(width: 8),
-                IconButton.filledTonal(
-                  tooltip: 'Enter',
-                  onPressed: () => k(TvKey.enter),
-                  icon: const Icon(Icons.keyboard_return),
-                ),
-                const Spacer(),
-                FilledButton.icon(
-                  onPressed: () {
-                    conn.text(c.text);
-                    c.clear();
-                  },
-                  icon: const Icon(Icons.send_rounded),
-                  label: const Text('Send'),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
+      builder: (ctx) => _TvKeyboardSheet(onKey: k),
     );
   }
 
@@ -835,5 +779,253 @@ class _PadDrag extends Drag {
   void cancel() {
     _longPress?.cancel();
     onDone();
+  }
+}
+
+/// Live keyboard: every character typed on the phone is inserted into the
+/// focused TV text field; deletions are sent as Backspace presses.
+class _TvKeyboardSheet extends StatefulWidget {
+  final void Function(int) onKey;
+  const _TvKeyboardSheet({required this.onKey});
+
+  @override
+  State<_TvKeyboardSheet> createState() => _TvKeyboardSheetState();
+}
+
+class _TvKeyboardSheetState extends State<_TvKeyboardSheet> {
+  final _c = TextEditingController();
+  String _sent = '';
+
+  void _sync(String value) {
+    var common = 0;
+    final max = value.length < _sent.length ? value.length : _sent.length;
+    while (common < max && value[common] == _sent[common]) {
+      common++;
+    }
+    for (var i = 0; i < _sent.length - common; i++) {
+      widget.onKey(TvKey.del);
+    }
+    if (value.length > common) conn.text(value.substring(common));
+    _sent = value;
+  }
+
+  void _clear() {
+    for (var i = 0; i < _sent.length; i++) {
+      widget.onKey(TvKey.del);
+    }
+    _sent = '';
+    _c.clear();
+  }
+
+  void _enter() {
+    haptic();
+    widget.onKey(TvKey.enter);
+    _sent = '';
+    _c.clear();
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        20,
+        0,
+        20,
+        MediaQuery.of(context).viewInsets.bottom + 20,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Type on TV',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Select a text field on the TV, then type. Letters appear on the TV as you type.',
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 14),
+          TextField(
+            controller: _c,
+            autofocus: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            textInputAction: TextInputAction.search,
+            decoration: const InputDecoration(hintText: 'Search or type text'),
+            onChanged: _sync,
+            onSubmitted: (_) => _enter(),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              IconButton.filledTonal(
+                tooltip: 'Backspace',
+                onPressed: () {
+                  haptic();
+                  if (_c.text.isNotEmpty) {
+                    _c.text = _c.text.substring(0, _c.text.length - 1);
+                    _sent = _c.text;
+                  }
+                  widget.onKey(TvKey.del);
+                },
+                icon: const Icon(Icons.backspace_outlined),
+              ),
+              const SizedBox(width: 8),
+              TextButton.icon(
+                onPressed: _clear,
+                icon: const Icon(Icons.clear_all_rounded),
+                label: const Text('Clear'),
+              ),
+              const Spacer(),
+              FilledButton.icon(
+                onPressed: _enter,
+                icon: const Icon(Icons.keyboard_return_rounded),
+                label: const Text('Enter'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Streams the phone microphone to the TV's voice search while open.
+class _VoiceSheet extends StatefulWidget {
+  const _VoiceSheet();
+
+  @override
+  State<_VoiceSheet> createState() => _VoiceSheetState();
+}
+
+class _VoiceSheetState extends State<_VoiceSheet> {
+  String? _error;
+  bool _started = false;
+
+  @override
+  void initState() {
+    super.initState();
+    conn.addListener(_onConn);
+    conn.startVoice().then((err) {
+      if (!mounted) return;
+      setState(() {
+        _error = err;
+        _started = err == null;
+      });
+    });
+  }
+
+  void _onConn() {
+    // Auto-close when listening ends (time limit reached).
+    if (_started && !conn.listening && mounted)
+      Navigator.of(context).maybePop();
+  }
+
+  @override
+  void dispose() {
+    conn.removeListener(_onConn);
+    if (conn.listening) conn.stopVoice();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+        child: ListenableBuilder(
+          listenable: conn,
+          builder: (context, _) {
+            final level = conn.voiceLevel;
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  _error != null
+                      ? 'Voice search unavailable'
+                      : conn.listening
+                      ? 'Listening… speak now'
+                      : 'Starting voice search…',
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  _error ??
+                      'Say what you want to watch, e.g. "funny cat videos". '
+                          'Results appear on the TV.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: _error != null ? cs.error : cs.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 28),
+                SizedBox(
+                  width: 150,
+                  height: 150,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      AnimatedContainer(
+                        duration: const Duration(milliseconds: 180),
+                        width: 96 + 54 * level,
+                        height: 96 + 54 * level,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: cs.primary.withValues(alpha: 0.18),
+                        ),
+                      ),
+                      Container(
+                        width: 88,
+                        height: 88,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: _error != null
+                              ? cs.surfaceContainerHighest
+                              : cs.primary,
+                        ),
+                        child: Icon(
+                          _error != null
+                              ? Icons.mic_off_rounded
+                              : Icons.mic_rounded,
+                          size: 44,
+                          color: _error != null
+                              ? cs.onSurfaceVariant
+                              : cs.onPrimary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 24),
+                FilledButton.tonal(
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size.fromHeight(50),
+                  ),
+                  onPressed: () async {
+                    if (conn.listening) await conn.stopVoice();
+                    if (context.mounted) Navigator.of(context).maybePop();
+                  },
+                  child: Text(conn.listening ? 'Done' : 'Close'),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
   }
 }

@@ -1,6 +1,11 @@
 package com.ammarimran.tv_cast_remote
 
+import android.Manifest
 import android.content.ActivityNotFoundException
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -17,6 +22,10 @@ import io.flutter.plugin.common.MethodChannel
 import java.util.ArrayDeque
 
 class MainActivity : FlutterActivity() {
+    companion object {
+        private const val MIC_REQUEST = 7301
+    }
+
     private val main = Handler(Looper.getMainLooper())
     private var nsd: NsdManager? = null
     private var multicastLock: WifiManager.MulticastLock? = null
@@ -24,6 +33,10 @@ class MainActivity : FlutterActivity() {
     private val listeners = mutableListOf<NsdManager.DiscoveryListener>()
     private val resolveQueue = ArrayDeque<NsdServiceInfo>()
     private var resolving = false
+
+    private var recorder: AudioRecord? = null
+    private var micSink: EventChannel.EventSink? = null
+    private var pendingMicPermission: MethodChannel.Result? = null
 
     private val serviceTypes = listOf("_androidtvremote2._tcp.", "_googlecast._tcp.")
 
@@ -42,8 +55,33 @@ class MainActivity : FlutterActivity() {
                 }
             })
 
+        EventChannel(messenger, "tvcast/mic").setStreamHandler(
+            object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, sink: EventChannel.EventSink?) {
+                    micSink = sink
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    micSink = null
+                }
+            })
+
         MethodChannel(messenger, "tvcast/native").setMethodCallHandler { call, result ->
             when (call.method) {
+                "micPermission" -> {
+                    if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                        PackageManager.PERMISSION_GRANTED) {
+                        result.success(true)
+                    } else {
+                        pendingMicPermission?.success(false)
+                        pendingMicPermission = result
+                        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), MIC_REQUEST)
+                    }
+                }
+                "startMic" -> result.success(startMic())
+                "stopMic" -> {
+                    stopMic(); result.success(null)
+                }
                 "startDiscovery" -> {
                     startDiscovery(); result.success(null)
                 }
@@ -189,7 +227,69 @@ class MainActivity : FlutterActivity() {
                 Uri.parse("https://play.google.com/store/apps/details?id=$pkg")))
     }
 
+    // ---------------- Microphone (voice search) ----------------
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == MIC_REQUEST) {
+            pendingMicPermission?.success(
+                grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED)
+            pendingMicPermission = null
+        }
+    }
+
+    /** Records 16-bit mono PCM at 8 kHz (what Android TV voice search expects)
+     *  and streams 8 KB chunks (512 ms) to Dart. */
+    private fun startMic(): Boolean {
+        stopMic()
+        val rate = 8000
+        val minBuf = AudioRecord.getMinBufferSize(
+            rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuf <= 0) return false
+        val rec = try {
+            AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, rate,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(minBuf, 16384))
+        } catch (_: Exception) {
+            return false
+        }
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            rec.release()
+            return false
+        }
+        recorder = rec
+        rec.startRecording()
+        Thread {
+            val buf = ByteArray(8192)
+            while (recorder === rec) {
+                var off = 0
+                while (off < buf.size && recorder === rec) {
+                    val n = rec.read(buf, off, buf.size - off)
+                    if (n <= 0) break
+                    off += n
+                }
+                if (off > 0) {
+                    val chunk = buf.copyOf(off)
+                    main.post { micSink?.success(chunk) }
+                }
+            }
+            try {
+                rec.stop()
+            } catch (_: Exception) {
+            }
+            rec.release()
+        }.start()
+        return true
+    }
+
+    private fun stopMic() {
+        recorder = null // the recording thread notices and releases it
+    }
+
     override fun onDestroy() {
+        stopMic()
         stopDiscovery()
         super.onDestroy()
     }

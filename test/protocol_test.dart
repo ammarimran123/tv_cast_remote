@@ -162,6 +162,8 @@ void main() {
   test('remote handshake, ping and key press against fake TV', () async {
     final server = await fakeTv(tv, client);
     final keys = <int>[];
+    final typed = <String>[];
+    final voice = <String>[];
     final gotKey = Completer<void>();
     var configured = false;
     server.listen((s) {
@@ -213,6 +215,32 @@ void main() {
             );
           } else if (m.has(9)) {
             expect(m.message(9)!.intField(1), 7);
+          } else if (m.has(21)) {
+            final edit = m.message(21)!;
+            final field = edit.message(3)!.message(2)!;
+            typed.add(
+              '${edit.intField(1)}/${edit.intField(2)}:${field.stringField(3)}',
+            );
+          } else if (m.has(30)) {
+            voice.add('begin ${m.message(30)!.intField(1)}');
+          } else if (m.has(31)) {
+            final p = m.message(31)!;
+            voice.add('audio ${p.intField(1)} ${p.bytesField(2)!.length}');
+          } else if (m.has(32)) {
+            voice.add('end ${m.message(32)!.intField(1)}');
+          } else if (m.has(10) && m.message(10)!.intField(1) == TvKey.search) {
+            // Real TVs open a voice session in reply to KEYCODE_SEARCH.
+            s.add(
+              varintFramed(
+                (ProtoWriter()..message(
+                      30,
+                      ProtoWriter()
+                        ..int32(1, 5)
+                        ..string(2, 'com.google.android.katniss'),
+                    ))
+                    .toBytes(),
+              ),
+            );
           } else if (m.has(10)) {
             keys.add(m.message(10)!.intField(1));
             expect(m.message(10)!.intField(2), KeyDirection.short);
@@ -234,6 +262,25 @@ void main() {
     await gotKey.future.timeout(const Duration(seconds: 5));
     await Future<void>.delayed(const Duration(milliseconds: 100));
     expect(keys, [TvKey.dpadCenter]);
+    // Text goes through the IME even when the TV never announced counters.
+    remote.sendText('dog');
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    expect(typed, ['0/0:dog']);
+
+    // Voice: Search key -> TV opens session -> we ack, stream, end.
+    final sid = await remote.startVoice();
+    expect(sid, 5);
+    remote.sendVoice(List.filled(100, 1)); // padded to 8 KB
+    remote.sendVoice(List.filled(30000, 1)); // split at 20 KB
+    remote.endVoice();
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    expect(voice, [
+      'begin 5',
+      'audio 5 8192',
+      'audio 5 20480',
+      'audio 5 9520',
+      'end 5',
+    ]);
     expect(volume?.level, 25);
     expect(model, 'Xiaomi MIBOX4');
     await remote.close();

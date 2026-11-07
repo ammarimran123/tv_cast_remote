@@ -164,8 +164,12 @@ class ClientIdentity {
 
   /// Generates a 2048-bit RSA key and self-signed certificate. Slow in pure
   /// Dart (a few seconds), so call it from a background isolate.
-  static ClientIdentity generate({String commonName = 'atvremote'}) {
+  static ClientIdentity generate({String? commonName}) {
     final seedSource = Random.secure();
+    // A unique name per install: the TV keeps one pairing per client name,
+    // so two phones sharing a name would unpair each other.
+    commonName ??=
+        'atvremote-${List.generate(8, (_) => seedSource.nextInt(16).toRadixString(16)).join()}';
     final rnd = FortunaRandom()
       ..seed(
         KeyParameter(
